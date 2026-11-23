@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # cooldowns.sh -- set and check dependency cooldown configurations
 #
@@ -13,9 +13,18 @@
 #   cooldowns.sh check
 #
 # Changelog:
+#   2026-11-16  Added nuget support (minPublishAgeHours on the nuget.org source, .NET SDK >= 11.0.100)
+#   2026-11-12  Cargo >= 1.100: no longer require cargo-cooldown; detect global-min-publish-age in ~/.cargo/config.toml; warn when cargo's cooldown is "0"
+#   2026-09-29  Fixed npm check reporting an unset min-release-age ("null") as configured
+#   2026-09-22  Write bun's bunfig to $XDG_CONFIG_HOME/.bunfig.toml when XDG_CONFIG_HOME is set
+#   2026-09-14  Switched cargo to CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE (COOLDOWN_MINUTES is deprecated since cargo-cooldown 0.3.1)
+#   2026-08-03  Added pdm support (strategy.exclude-newer via pdm config, pdm >= 2.27.0)
+#   2026-06-04  Added bundler support (BUNDLE_COOLDOWN export, Bundler >= 4.0.13)
+#   2026-06-01  Added poetry support (solver.min-release-age, poetry >= 2.4.0)
+#   2026-05-28  Use pnpm config set --global for pnpm to avoid npm unknown-key warnings
 #   2026-05-07  Added pip 26.1+ duration format support (e.g. P3D)
 #
-# Supported tools: pip, uv, npm, pnpm, yarn, bun, deno, cargo
+# Supported tools: pip, uv, poetry, pdm, npm, pnpm, yarn, bun, deno, cargo, bundler, nuget
 #
 # Where configs are written:
 #   pip    Shell wrapper (pip < 26.1) or env var export (pip >= 26.1)
@@ -23,12 +32,19 @@
 #          - pip 26.1+ uses duration format: PIP_UPLOADED_PRIOR_TO="P3D"
 #          - pip < 26.1 uses shell wrapper with absolute timestamps
 #   uv     UV_EXCLUDE_NEWER export in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+#   poetry solver.min-release-age via poetry config (writes to poetry's config.toml)
+#   pdm    strategy.exclude-newer via pdm config (writes to pdm's global config.toml)
 #   npm    min-release-age in ~/.npmrc
-#   pnpm   minimum-release-age in ~/.npmrc
+#   pnpm   minimum-release-age via pnpm config set --global (writes to pnpm's global rc)
 #   yarn   YARN_NPM_MINIMAL_AGE_GATE export in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
-#   bun    minimumReleaseAge in ~/.bunfig.toml
+#   bun    minimumReleaseAge in ~/.bunfig.toml (or $XDG_CONFIG_HOME/.bunfig.toml)
 #   deno   Aliases in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
-#   cargo  COOLDOWN_MINUTES export in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+#   cargo  CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE export in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+#          (read natively by Cargo >= 1.100, and by cargo-cooldown >= 0.3.1 on older Cargo)
+#   bundler BUNDLE_COOLDOWN export in /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+#          (requires Bundler >= 4.0.13)
+#   nuget  minPublishAgeHours on the nuget.org source in ~/.nuget/NuGet/NuGet.Config
+#          (requires .NET SDK >= 11.0.100)
 #
 # Profile scripts fall back to the user's rc file (~/.zshrc or ~/.bashrc, based
 # on $SHELL) when /etc/profile.d is not writable.
@@ -46,16 +62,25 @@ set -euo pipefail
 #   date_to_epoch    YYYY-MM-DD -> epoch seconds
 #   _date_days_ago   emits a `date ...` command string for "N days ago in UTC"
 #   copy_mode_from   chmod DEST to SRC's mode (mktemp files are often 0600)
+# Detect sed FLAVOR (not OS) -- BSD and GNU sed disagree on -i semantics:
+#   BSD sed:  -i SUFFIX     ('' means no backup, requires the empty arg)
+#   GNU sed:  -i[SUFFIX]    (no space; passing -i '' treats '' as the script)
+# Macs commonly have GNU sed in PATH (brew install gnu-sed), so OSTYPE alone
+# is not enough -- ask sed itself.
+if sed --version 2>/dev/null | grep -q "GNU sed"; then
+    SED_INPLACE=(sed -i)
+else
+    SED_INPLACE=(sed -i '')
+fi
+
 case "$OSTYPE" in
     darwin*|*bsd*)
-        SED_INPLACE=(sed -i '')
         date_to_epoch()   { date -j -f '%Y-%m-%d' "$1" +%s 2>/dev/null || echo ""; }
         _date_days_ago()  { echo "date -u -v-${1}d '+%Y-%m-%dT%H:%M:%SZ'"; }
         # macOS chmod has no --reference; %OLp is permission bits (not full st_mode).
         copy_mode_from() { local src="$1" dest="$2"; chmod "$(stat -f %OLp "$src")" "$dest"; }
         ;;
     *)
-        SED_INPLACE=(sed -i)
         date_to_epoch()   { date -d "$1" +%s 2>/dev/null || echo ""; }
         _date_days_ago()  { echo "date -u -d '$1 days ago' '+%Y-%m-%dT%H:%M:%SZ'"; }
         # GNU chmod: clone mode from SRC (see `chmod --help`).
@@ -68,15 +93,20 @@ esac
 # ---------------------------------------------------------------------------
 
 # Get pip version (e.g., "26.1.0" -> "26.1.0")
-# Returns empty string if pip is not installed
+# Returns empty string if neither pip nor pip3 is on PATH (e.g. Homebrew only ships pip3)
 get_pip_version() {
-    if ! command -v pip &>/dev/null; then
+    local pip_cmd=""
+    if command -v pip &>/dev/null; then
+        pip_cmd=pip
+    elif command -v pip3 &>/dev/null; then
+        pip_cmd=pip3
+    else
         echo ""
         return 1
     fi
 
     local version
-    version=$(command pip --version 2>/dev/null | awk '{print $2; exit}')
+    version=$(command "$pip_cmd" --version 2>/dev/null | awk '{print $2; exit}')
     echo "$version"
 }
 
@@ -179,12 +209,15 @@ duration_for_tool() {
     local tool="$2"
     case "$tool" in
         uv)       echo "$days days" ;;
+        pdm)      echo "${days}d" ;;                     # relative duration
         npm)      echo "$days" ;;                       # days
         pnpm)     echo $(( days * 24 * 60 )) ;;         # minutes
         bun)      echo $(( days * 24 * 60 * 60 )) ;;    # seconds
         deno)     echo "P${days}D" ;;                    # ISO 8601
         yarn)     echo $(( days * 24 * 60 )) ;;          # minutes
-        cargo)    echo $(( days * 24 * 60 )) ;;          # minutes
+        cargo)    echo "$days days" ;;                   # RFC 3923 duration
+        bundler)  echo "$days" ;;                         # integer days
+        nuget)    echo $(( days * 24 )) ;;               # hours
         *)        echo "$days" ;;
     esac
 }
@@ -256,26 +289,28 @@ SHELL
         echo "pip: set PIP_UPLOADED_PRIOR_TO=\"P${days}D\" in $PROFILE_SCRIPT"
     else
         # Use shell wrapper for older pip or when pip is not installed
-        local date_cmd
+        local date_cmd pip_for_command
         date_cmd=$(_date_days_ago "$days")
+        pip_for_command=pip
+        command -v pip &>/dev/null || pip_for_command=pip3
 
         cat >> "$PROFILE_SCRIPT" << SHELL
 # cooldowns:pip:start
-pip() {
+${pip_for_command}() {
     local pip_major cutoff
-    pip_major=\$(command pip --version 2>/dev/null | awk '{ split(\$2, a, "."); print a[1]; exit }')
+    pip_major=\$(command ${pip_for_command} --version 2>/dev/null | awk '{ split(\$2, a, "."); print a[1]; exit }')
     case "\$1" in
         install|download|wheel)
             if [[ "\${pip_major:-0}" -ge 26 ]]; then
                 cutoff=\$($date_cmd)
-                command pip "\$1" --uploaded-prior-to "\$cutoff" "\${@:2}"
+                command ${pip_for_command} "\$1" --uploaded-prior-to "\$cutoff" "\${@:2}"
             else
                 echo "warning: pip \${pip_major:-unknown} does not support --uploaded-prior-to (need >= 26), skipping cooldown" >&2
-                command pip "\$@"
+                command ${pip_for_command} "\$@"
             fi
             ;;
         *)
-            command pip "\$@"
+            command ${pip_for_command} "\$@"
             ;;
     esac
 }
@@ -323,6 +358,69 @@ SHELL
     echo "uv: set UV_EXCLUDE_NEWER=\"$duration\" in $PROFILE_SCRIPT"
 }
 
+set_poetry() {
+    local days="$1"
+    if ! command -v poetry &>/dev/null; then
+        echo "poetry: not installed, skipping"
+        return
+    fi
+
+    local poetry_version
+    poetry_version=$(poetry --version 2>/dev/null | awk '{ gsub(/[()]/, ""); print $NF }')
+    if [[ -n "$poetry_version" ]] && ! version_gte "$poetry_version" "2.4.0"; then
+        echo "poetry: solver.min-release-age requires poetry >= 2.4.0 (found $poetry_version), skipping"
+        return
+    fi
+
+    local existing
+    existing=$(poetry config solver.min-release-age 2>/dev/null || true)
+    if [[ -n "$existing" && "$existing" != "Not set" && "$existing" != "0" ]]; then
+        echo "poetry: solver.min-release-age is already set to '$existing', skipping"
+        return
+    fi
+
+    if [[ -n "${POETRY_SOLVER_MIN_RELEASE_AGE:-}" ]]; then
+        echo "poetry: POETRY_SOLVER_MIN_RELEASE_AGE is already set to '$POETRY_SOLVER_MIN_RELEASE_AGE', skipping"
+        return
+    fi
+
+    local existing_file
+    if existing_file=$(find_in_profiles "POETRY_SOLVER_MIN_RELEASE_AGE="); then
+        echo "poetry: POETRY_SOLVER_MIN_RELEASE_AGE is already configured in $existing_file, skipping"
+        return
+    fi
+
+    poetry config solver.min-release-age "$days"
+    echo "poetry: set solver.min-release-age=$days in poetry config"
+}
+
+set_pdm() {
+    local days="$1"
+    if ! command -v pdm &>/dev/null; then
+        echo "pdm: not installed, skipping"
+        return
+    fi
+
+    local pdm_version
+    pdm_version=$(pdm --version 2>/dev/null | awk '{ print $NF }')
+    if [[ -n "$pdm_version" ]] && ! version_gte "$pdm_version" "2.27.0"; then
+        echo "pdm: strategy.exclude-newer requires pdm >= 2.27.0 (found $pdm_version), skipping"
+        return
+    fi
+
+    local existing
+    existing=$(pdm config strategy.exclude-newer 2>/dev/null || true)
+    if [[ -n "$existing" && "$existing" != "None" ]]; then
+        echo "pdm: strategy.exclude-newer is already set to '$existing', skipping"
+        return
+    fi
+
+    local duration
+    duration=$(duration_for_tool "$days" pdm)
+    pdm config strategy.exclude-newer "$duration"
+    echo "pdm: set strategy.exclude-newer=$duration in pdm config"
+}
+
 set_npmrc_key() {
     local tool="$1" key="$2" days="$3"
     local duration
@@ -352,7 +450,26 @@ set_npm() {
 }
 
 set_pnpm() {
-    set_npmrc_key pnpm minimum-release-age "$1"
+    local days="$1"
+    if ! command -v pnpm &>/dev/null; then
+        echo "pnpm: not installed, skipping"
+        return
+    fi
+    local duration
+    duration=$(duration_for_tool "$days" pnpm)
+
+    local existing
+    existing=$(pnpm config get minimum-release-age 2>/dev/null || true)
+    if [[ -n "$existing" && "$existing" != "undefined" ]]; then
+        echo "pnpm: minimum-release-age is already set to '$existing', skipping"
+        return
+    fi
+
+    pnpm config set minimum-release-age "$duration" --global
+    local globalconfig
+    globalconfig=$(pnpm config get globalconfig 2>/dev/null || true)
+    [[ -z "$globalconfig" || "$globalconfig" == "undefined" ]] && globalconfig="pnpm global config"
+    echo "pnpm: set minimum-release-age=$duration in $globalconfig"
 }
 
 set_yarn() {
@@ -388,7 +505,8 @@ set_bun() {
     local days="$1"
     local duration
     duration=$(duration_for_tool "$days" bun)
-    local bunfig="${HOME}/.bunfig.toml"
+    # Bun reads $XDG_CONFIG_HOME/.bunfig.toml when XDG_CONFIG_HOME is set, with no fallback to $HOME.
+    local bunfig="${XDG_CONFIG_HOME:-$HOME}/.bunfig.toml"
 
     if [[ -f "$bunfig" ]] && grep -q "minimumReleaseAge" "$bunfig" 2>/dev/null; then
         local val
@@ -413,6 +531,7 @@ set_bun() {
             printf '\n[install]\nminimumReleaseAge = %s\n' "$duration" >> "$bunfig"
         fi
     else
+        mkdir -p "$(dirname "$bunfig")"
         printf '[install]\nminimumReleaseAge = %s\n' "$duration" > "$bunfig"
     fi
     echo "bun: set minimumReleaseAge = $duration in $bunfig"
@@ -439,24 +558,80 @@ SHELL
     echo "  note: deno has no persistent config for this; use 'deno-update' and 'deno-outdated' aliases"
 }
 
+# Cargo >= 1.100 reads CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE itself, so the
+# cargo-cooldown subcommand is only needed on older toolchains.
+cargo_has_native_cooldown() {
+    local version
+    # "cargo 1.100.0 (abc 2026-11-05)"; strip pre-release suffixes like "-nightly"
+    version=$(cargo --version 2>/dev/null | awk '{sub(/-.*/, "", $2); print $2; exit}')
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]] && version_gte "$version" "1.100"
+}
+
+# Print "<value>\t<file>" for registry.global-min-publish-age in Cargo's user
+# config, so check/set can see a cooldown configured there instead of via env.
+cargo_config_publish_age() {
+    local home="${CARGO_HOME:-$HOME/.cargo}" f val
+    # Cargo reads the extensionless legacy file when both exist
+    for f in "$home/config" "$home/config.toml"; do
+        [[ -f "$f" ]] || continue
+        val=$(awk '
+            { sub(/\r$/, "") }
+            /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
+            {
+                key = ""
+                if (section == "[registry]") key = "global-min-publish-age"
+                else if (section == "") key = "registry\\.global-min-publish-age"
+                if (key != "" && match($0, "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*")) {
+                    val = substr($0, RSTART + RLENGTH)
+                    sub(/[[:space:]]*(#.*)?$/, "", val)
+                    gsub(/^["'\'']|["'\'']$/, "", val)
+                    print val
+                    exit
+                }
+            }
+        ' "$f")
+        if [[ -n "$val" ]]; then
+            printf '%s\t%s\n' "$val" "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# "0" (with or without a unit) is Cargo's way of turning the cooldown off.
+cargo_age_disabled() {
+    [[ "$1" =~ ^0+([[:space:]]*[a-z]+)?$ ]]
+}
+
 set_cargo() {
     local days="$1"
     if ! command -v cargo &>/dev/null; then
         echo "cargo: not installed, skipping"
         return
     fi
-    local minutes
-    minutes=$(duration_for_tool "$days" cargo)
+    local value
+    value=$(duration_for_tool "$days" cargo)
     ensure_profile_dir
 
     if ! find_in_profiles "cooldowns:cargo:start" &>/dev/null; then
-        if [[ -n "${COOLDOWN_MINUTES:-}" ]]; then
-            echo "cargo: COOLDOWN_MINUTES is already set to '$COOLDOWN_MINUTES', skipping"
+        local hint=""
+        if [[ -n "${CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE:-}" ]]; then
+            cargo_age_disabled "$CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE" && hint=" (this disables the cooldown; unset it and re-run)"
+            echo "cargo: CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE is already set to '$CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE', skipping$hint"
             return
         fi
         local existing_file
-        if existing_file=$(find_in_profiles "COOLDOWN_MINUTES="); then
-            echo "cargo: COOLDOWN_MINUTES is already configured in $existing_file, skipping"
+        if existing_file=$(find_in_profiles "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="); then
+            cargo_age_disabled "$(extract_kv CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE "$existing_file")" \
+                && hint=" (it disables the cooldown; remove it and re-run)"
+            echo "cargo: CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE is already configured in $existing_file, skipping$hint"
+            return
+        fi
+        # A "0" in Cargo's config is replaced by the env var, which takes precedence
+        local cfg
+        if cargo_has_native_cooldown && cfg=$(cargo_config_publish_age) \
+           && ! cargo_age_disabled "${cfg%%$'\t'*}"; then
+            echo "cargo: global-min-publish-age is already set to '${cfg%%$'\t'*}' in ${cfg#*$'\t'}, skipping"
             return
         fi
     fi
@@ -465,18 +640,140 @@ set_cargo() {
 
     cat >> "$PROFILE_SCRIPT" << SHELL
 # cooldowns:cargo:start
-export COOLDOWN_MINUTES="$minutes"
+export CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="$value"
 # cooldowns:cargo:end
 SHELL
-    echo "cargo: set COOLDOWN_MINUTES=$minutes in $PROFILE_SCRIPT"
-    echo "  note: cargo has no native cooldown support. You must use 'cargo cooldown <command>' instead of 'cargo <command>'."
-    echo "  Install the crate with: cargo install cargo-cooldown"
+    echo "cargo: set CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=\"$value\" in $PROFILE_SCRIPT"
+    if ! cargo_has_native_cooldown; then
+        echo "  note: Cargo < 1.100 has no native cooldown support. You must use 'cargo cooldown <command>' instead of 'cargo <command>'."
+        echo "  Install the crate with: cargo install cargo-cooldown (>= 0.3.1)"
+    fi
+}
+
+set_bundler() {
+    local days="$1"
+    # Bundler reads BUNDLE_COOLDOWN at runtime; the export is harmless without
+    # bundler installed, so (like yarn) we don't gate on `command -v bundle`.
+    local value
+    value=$(duration_for_tool "$days" bundler)
+    ensure_profile_dir
+
+    if ! find_in_profiles "cooldowns:bundler:start" &>/dev/null; then
+        if [[ -n "${BUNDLE_COOLDOWN:-}" ]]; then
+            echo "bundler: BUNDLE_COOLDOWN is already set to '$BUNDLE_COOLDOWN', skipping"
+            return
+        fi
+        local existing_file
+        if existing_file=$(find_in_profiles "BUNDLE_COOLDOWN="); then
+            echo "bundler: BUNDLE_COOLDOWN is already configured in $existing_file, skipping"
+            return
+        fi
+    fi
+
+    clean_previous bundler "$PROFILE_SCRIPT"
+
+    cat >> "$PROFILE_SCRIPT" << SHELL
+# cooldowns:bundler:start
+export BUNDLE_COOLDOWN="$value"
+# cooldowns:bundler:end
+SHELL
+    echo "bundler: set BUNDLE_COOLDOWN=$value in $PROFILE_SCRIPT"
+    echo "  note: requires Bundler >= 4.0.13. Per-project you can instead run 'bundle config set cooldown $value' or add 'cooldown: $value' to a Gemfile source."
+}
+
+NUGET_ORG_URL="https://api.nuget.org/v3/index.json"
+
+# The user-level config that `dotnet nuget` reads on Linux and macOS.
+nuget_user_config() {
+    echo "$HOME/.nuget/NuGet/NuGet.Config"
+}
+
+# SDK version from / so that a global.json in the current directory can't pin
+# an older SDK. A prerelease suffix ("11.0.100-rc.2...") is dropped.
+nuget_sdk_version() {
+    local version
+    version=$(cd / && dotnet --version 2>/dev/null) || return 1
+    echo "${version%%-*}"
+}
+
+# Print "<key><TAB><minPublishAgeHours>" for the nuget.org package source in the
+# given config (age is empty when unset). The source is matched by its key or by
+# its URL, ignoring case and a trailing slash; <add> elements outside
+# <packageSources> (e.g. <auditSources>) are not sources. NuGet writes each <add>
+# on one line.
+nuget_org_source() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    awk -v url="$NUGET_ORG_URL" '
+        function attr(line, name,    m) {
+            if (match(line, name "=\"[^\"]*\"")) {
+                m = substr(line, RSTART + length(name) + 2, RLENGTH - length(name) - 3)
+                return m
+            }
+            return ""
+        }
+        /<packageSources[[:space:]>]/ { in_sources = 1 }
+        /<\/packageSources>/ { in_sources = 0 }
+        in_sources && /<add[[:space:]]/ {
+            key = attr($0, "key")
+            value = tolower(attr($0, "value"))
+            sub(/\/$/, "", value)
+            if (tolower(key) == "nuget.org" || value == url) {
+                printf "%s\t%s\n", key, attr($0, "minPublishAgeHours")
+                found = 1
+                exit
+            }
+        }
+        END { exit !found }
+    ' "$file"
+}
+
+set_nuget() {
+    local days="$1"
+    if ! command -v dotnet &>/dev/null; then
+        echo "nuget: not installed, skipping"
+        return
+    fi
+    local sdk_version
+    sdk_version=$(nuget_sdk_version) || sdk_version=""
+    if [[ -z "$sdk_version" ]] || ! version_gte "$sdk_version" "11.0.100"; then
+        echo "nuget: minPublishAgeHours requires .NET SDK >= 11.0.100 (found ${sdk_version:-none}), skipping"
+        return
+    fi
+
+    local hours cfg source key="" age=""
+    hours=$(duration_for_tool "$days" nuget)
+    cfg=$(nuget_user_config)
+    if source=$(nuget_org_source "$cfg"); then
+        key="${source%%$'\t'*}"
+        age="${source#*$'\t'}"
+    fi
+    if [[ -n "$age" && "$age" != "0" ]]; then
+        echo "nuget: minPublishAgeHours is already set to '$age' on source '$key' in $cfg, skipping"
+        return
+    fi
+
+    # Run from / so a nuget.config in the current directory isn't consulted.
+    # dotnet prints its errors on stdout, so show the output only on failure.
+    local out
+    if [[ -n "$key" ]]; then
+        out=$(cd / && dotnet nuget update source "$key" --min-publish-age-hours "$hours" --configfile "$cfg" 2>&1) \
+            || { echo "nuget: failed to update source '$key' in $cfg: $out" >&2; return 1; }
+    else
+        key="nuget.org"
+        mkdir -p "$(dirname "$cfg")"
+        [[ -f "$cfg" ]] || printf '<?xml version="1.0" encoding="utf-8"?>\n<configuration>\n</configuration>\n' > "$cfg"
+        out=$(cd / && dotnet nuget add source "$NUGET_ORG_URL" -n "$key" --min-publish-age-hours "$hours" --configfile "$cfg" 2>&1) \
+            || { echo "nuget: failed to add source '$key' to $cfg: $out" >&2; return 1; }
+    fi
+    echo "nuget: set minPublishAgeHours=$hours on source '$key' in $cfg"
+    echo "  note: applies to 'dotnet package add' and 'dotnet package update'; a project nuget.config that redefines this source, or any other source, needs its own minPublishAgeHours."
 }
 
 do_set() {
     if [[ $# -lt 2 ]]; then
         echo "usage: cooldowns.sh set <tool> <duration>" >&2
-        echo "tools: pip, uv, npm, pnpm, yarn, bun, deno, cargo" >&2
+        echo "tools: pip, uv, poetry, pdm, npm, pnpm, yarn, bun, deno, cargo, bundler, nuget" >&2
         return 1
     fi
 
@@ -487,15 +784,19 @@ do_set() {
     case "$tool" in
         pip)   set_pip "$days" ;;
         uv)    set_uv "$days" ;;
+        poetry) set_poetry "$days" ;;
+        pdm)   set_pdm "$days" ;;
         npm)   set_npm "$days" ;;
         pnpm)  set_pnpm "$days" ;;
         yarn)  set_yarn "$days" ;;
         bun)   set_bun "$days" ;;
         deno)  set_deno "$days" ;;
         cargo) set_cargo "$days" ;;
+        bundler) set_bundler "$days" ;;
+        nuget) set_nuget "$days" ;;
         *)
             echo "error: unknown tool '$tool'" >&2
-            echo "supported: pip, uv, npm, pnpm, yarn, bun, deno, cargo" >&2
+            echo "supported: pip, uv, poetry, pdm, npm, pnpm, yarn, bun, deno, cargo, bundler, nuget" >&2
             return 1
             ;;
     esac
@@ -650,17 +951,43 @@ check_uv() {
     record uv $STATUS_MISSING "no cooldown configured"
 }
 
-check_npmrc_key() {
-    local tool="$1" key="$2"
-    local npmrc="${HOME}/.npmrc"
-    local val
-    if [[ -f "$npmrc" ]]; then
-        if val=$(extract_kv "$key" "$npmrc"); then
-            record "$tool" $STATUS_OK "${key}=$val in $npmrc"
-            return 0
+check_poetry() {
+    if [[ -n "${POETRY_SOLVER_MIN_RELEASE_AGE:-}" ]]; then
+        record poetry $STATUS_OK "POETRY_SOLVER_MIN_RELEASE_AGE=${POETRY_SOLVER_MIN_RELEASE_AGE} (${POETRY_SOLVER_MIN_RELEASE_AGE}d)"
+        return
+    fi
+
+    if command -v poetry &>/dev/null; then
+        local val
+        val=$(poetry config solver.min-release-age 2>/dev/null || true)
+        if [[ -n "$val" && "$val" != "Not set" && "$val" != "0" ]]; then
+            record poetry $STATUS_OK "solver.min-release-age=$val (poetry config)"
+            return
         fi
     fi
-    return 1
+
+    local profile_file
+    if profile_file=$(find_in_profiles "POETRY_SOLVER_MIN_RELEASE_AGE="); then
+        local val
+        val=$(extract_kv POETRY_SOLVER_MIN_RELEASE_AGE "$profile_file" || echo "")
+        record poetry $STATUS_OK "POETRY_SOLVER_MIN_RELEASE_AGE=$val in $profile_file (not yet sourced)"
+        return
+    fi
+
+    record poetry $STATUS_MISSING "no cooldown configured"
+}
+
+check_pdm() {
+    if command -v pdm &>/dev/null; then
+        local val
+        val=$(pdm config strategy.exclude-newer 2>/dev/null || true)
+        if [[ -n "$val" && "$val" != "None" ]]; then
+            record pdm $STATUS_OK "strategy.exclude-newer=$val (pdm config)"
+            return
+        fi
+    fi
+
+    record pdm $STATUS_MISSING "no cooldown configured"
 }
 
 check_npm() {
@@ -684,7 +1011,7 @@ check_npm() {
 
     if [[ -n "$npm_major" ]]; then
         val=$(npm config get min-release-age 2>/dev/null || true)
-        if [[ -n "$val" && "$val" != "undefined" ]]; then
+        if [[ -n "$val" && "$val" != "undefined" && "$val" != "null" ]]; then
             record npm $STATUS_OK "min-release-age=$val (npm config)"
             return
         fi
@@ -694,7 +1021,19 @@ check_npm() {
 }
 
 check_pnpm() {
-    check_npmrc_key pnpm minimum-release-age && return
+    local val
+    val=$(pnpm config get minimum-release-age 2>/dev/null || true)
+    if [[ -n "$val" && "$val" != "undefined" ]]; then
+        record pnpm $STATUS_OK "minimum-release-age=$val (pnpm global config)"
+        return
+    fi
+    # pnpm v11+ ships a built-in default of 1440 minutes (1 day)
+    local pnpm_ver
+    pnpm_ver=$(pnpm --version 2>/dev/null)
+    if [[ -n "$pnpm_ver" ]] && version_gte "$pnpm_ver" "11.0.0"; then
+        record pnpm $STATUS_OK "v11+ built-in default (1440 min / 1 day)"
+        return
+    fi
     record pnpm $STATUS_MISSING "no cooldown configured"
 }
 
@@ -717,7 +1056,8 @@ check_yarn() {
 }
 
 check_bun() {
-    local bunfig="${HOME}/.bunfig.toml"
+    # Bun reads $XDG_CONFIG_HOME/.bunfig.toml when XDG_CONFIG_HOME is set, with no fallback to $HOME.
+    local bunfig="${XDG_CONFIG_HOME:-$HOME}/.bunfig.toml"
     if [[ -f "$bunfig" ]]; then
         local val
         if val=$(extract_kv minimumReleaseAge "$bunfig"); then
@@ -740,26 +1080,99 @@ check_deno() {
 }
 
 check_cargo() {
-    if ! cargo install --list 2>/dev/null | grep -q '^cargo-cooldown '; then
-        record cargo $STATUS_WARN "cargo-cooldown crate is not installed"
+    if ! command -v cargo &>/dev/null; then
+        record cargo $STATUS_WARN "cargo not found on PATH"
         return
     fi
 
-    if [[ -n "${COOLDOWN_MINUTES:-}" ]]; then
-        record cargo $STATUS_OK "COOLDOWN_MINUTES=$COOLDOWN_MINUTES ($(minutes_to_days "$COOLDOWN_MINUTES")d)"
+    local native=0
+    cargo_has_native_cooldown && native=1
+    if (( ! native )) && ! cargo install --list 2>/dev/null | grep -q '^cargo-cooldown '; then
+        record cargo $STATUS_WARN "Cargo < 1.100 and cargo-cooldown crate is not installed"
         return
+    fi
+
+    # Sources in Cargo's precedence order: env var, profile export (once
+    # sourced), then Cargo's own config
+    local val="" desc=""
+    if [[ -n "${CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE:-}" ]]; then
+        val="$CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE"
+        desc="CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=\"$val\""
     fi
 
     local profile_file
-    if profile_file=$(find_in_profiles "cooldowns:cargo:start") \
-       || profile_file=$(find_in_profiles "COOLDOWN_MINUTES="); then
-        local val
-        val=$(extract_kv COOLDOWN_MINUTES "$profile_file" || echo "")
-        record cargo $STATUS_OK "COOLDOWN_MINUTES=$val ($(minutes_to_days "$val")d) in $profile_file (not yet sourced)"
+    if [[ -z "$val" ]] && { profile_file=$(find_in_profiles "cooldowns:cargo:start") \
+       || profile_file=$(find_in_profiles "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="); }; then
+        val=$(extract_kv CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE "$profile_file" || echo "")
+        [[ -n "$val" ]] && desc="CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=\"$val\" in $profile_file (not yet sourced)"
+    fi
+
+    # cargo-cooldown reads its own cooldown.toml, so Cargo's config only counts natively
+    local cfg
+    if [[ -z "$val" ]] && (( native )) && cfg=$(cargo_config_publish_age); then
+        val="${cfg%%$'\t'*}"
+        desc="global-min-publish-age = \"$val\" in ${cfg#*$'\t'}"
+    fi
+
+    if [[ -n "$val" ]]; then
+        if cargo_age_disabled "$val"; then
+            record cargo $STATUS_WARN "$desc disables the cooldown"
+        else
+            record cargo $STATUS_OK "$desc"
+        fi
+        return
+    fi
+
+    # Configs written before 2026-09-14 used cargo-cooldown's deprecated variable
+    if [[ -n "${COOLDOWN_MINUTES:-}" ]] || find_in_profiles "COOLDOWN_MINUTES=" &>/dev/null; then
+        record cargo $STATUS_WARN "COOLDOWN_MINUTES is deprecated since cargo-cooldown 0.3.1; re-run 'cooldowns.sh set cargo <duration>'"
         return
     fi
 
     record cargo $STATUS_MISSING "no cooldown configured"
+}
+
+check_bundler() {
+    if [[ -n "${BUNDLE_COOLDOWN:-}" ]]; then
+        record bundler $STATUS_OK "BUNDLE_COOLDOWN=$BUNDLE_COOLDOWN (${BUNDLE_COOLDOWN}d)"
+        return
+    fi
+
+    local profile_file
+    if profile_file=$(find_in_profiles "cooldowns:bundler:start") \
+       || profile_file=$(find_in_profiles "BUNDLE_COOLDOWN="); then
+        local val
+        val=$(extract_kv BUNDLE_COOLDOWN "$profile_file" || echo "")
+        record bundler $STATUS_OK "BUNDLE_COOLDOWN=$val (${val}d) in $profile_file (not yet sourced)"
+        return
+    fi
+
+    record bundler $STATUS_MISSING "no cooldown configured"
+}
+
+check_nuget() {
+    local cfg source key="" age=""
+    cfg=$(nuget_user_config)
+    if source=$(nuget_org_source "$cfg"); then
+        key="${source%%$'\t'*}"
+        age="${source#*$'\t'}"
+    fi
+
+    if command -v dotnet &>/dev/null; then
+        local sdk_version
+        sdk_version=$(nuget_sdk_version) || sdk_version=""
+        if [[ -z "$sdk_version" ]] || ! version_gte "$sdk_version" "11.0.100"; then
+            record nuget $STATUS_WARN ".NET SDK ${sdk_version:-unknown} has no cooldown support (needs >= 11.0.100)"
+            return
+        fi
+    fi
+
+    if [[ "$age" =~ ^[0-9]+$ && "$age" -gt 0 ]]; then
+        record nuget $STATUS_OK "minPublishAgeHours=$age ($(( age / 24 ))d) on source '$key' in $cfg"
+        return
+    fi
+
+    record nuget $STATUS_MISSING "no cooldown configured"
 }
 
 tool_is_relevant() {
@@ -767,17 +1180,25 @@ tool_is_relevant() {
     command -v "$tool" &>/dev/null && return 0
     find_in_profiles "cooldowns:${tool}:start" &>/dev/null && return 0
     case "$tool" in
-        pip)   [[ -f "${HOME}/.config/pip/pip.conf" || -f "${HOME}/.pip/pip.conf" || -n "${PIP_UPLOADED_PRIOR_TO:-}" ]] && return 0
+        pip)   command -v pip3 &>/dev/null && return 0
+               [[ -f "${HOME}/.config/pip/pip.conf" || -f "${HOME}/.pip/pip.conf" || -n "${PIP_UPLOADED_PRIOR_TO:-}" ]] && return 0
                find_in_profiles "PIP_UPLOADED_PRIOR_TO=" &>/dev/null && return 0 ;;
         uv)    [[ -f "${HOME}/.config/uv/uv.toml" || -n "${UV_EXCLUDE_NEWER:-}" ]] && return 0
                find_in_profiles "UV_EXCLUDE_NEWER=" &>/dev/null && return 0 ;;
+        poetry) [[ -n "${POETRY_SOLVER_MIN_RELEASE_AGE:-}" ]] && return 0
+               find_in_profiles "POETRY_SOLVER_MIN_RELEASE_AGE=" &>/dev/null && return 0 ;;
         npm)   [[ -f "${HOME}/.npmrc" ]] && grep -q "min-release-age" "${HOME}/.npmrc" 2>/dev/null && return 0 ;;
-        pnpm)  [[ -f "${HOME}/.npmrc" ]] && grep -q "minimum-release-age" "${HOME}/.npmrc" 2>/dev/null && return 0 ;;
+        pnpm)  command -v pnpm &>/dev/null && pnpm config get minimum-release-age 2>/dev/null | grep -qv "^undefined$" && return 0 ;;
         bun)   [[ -f "${HOME}/.bunfig.toml" ]] && return 0 ;;
-        cargo) [[ -n "${COOLDOWN_MINUTES:-}" ]] && return 0
+        cargo) [[ -n "${CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE:-}" || -n "${COOLDOWN_MINUTES:-}" ]] && return 0
+               find_in_profiles "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=" &>/dev/null && return 0
                find_in_profiles "COOLDOWN_MINUTES=" &>/dev/null && return 0 ;;
         yarn)  [[ -n "${YARN_NPM_MINIMAL_AGE_GATE:-}" ]] && return 0
                find_in_profiles "YARN_NPM_MINIMAL_AGE_GATE=" &>/dev/null && return 0 ;;
+        bundler) [[ -n "${BUNDLE_COOLDOWN:-}" ]] && return 0
+               find_in_profiles "BUNDLE_COOLDOWN=" &>/dev/null && return 0 ;;
+        nuget) command -v dotnet &>/dev/null && return 0
+               grep -q "minPublishAgeHours" "$(nuget_user_config)" 2>/dev/null && return 0 ;;
     esac
     return 1
 }
@@ -788,7 +1209,7 @@ do_check() {
 
     local any_checked=false
 
-    for tool in pip uv npm pnpm yarn bun deno cargo; do
+    for tool in pip uv poetry pdm npm pnpm yarn bun deno cargo bundler nuget; do
         if tool_is_relevant "$tool"; then
             any_checked=true
             "check_${tool}"
@@ -843,7 +1264,7 @@ commands:
   set <tool> <duration>   Configure cooldown for a package manager
   check                   Check cooldown status for all installed tools
 
-tools: pip, uv, npm, pnpm, yarn, bun, deno, cargo
+tools: pip, uv, poetry, pdm, npm, pnpm, yarn, bun, deno, cargo, bundler, nuget
 
 duration examples: 3d, "3 days", 7d, 1d
 
@@ -851,13 +1272,18 @@ where configs are written (all user-wide; project-level configs are not modified
   pip    env var (26.1+) or shell wrapper (older)
                             /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
   uv     env var export     /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+  poetry poetry config      ~/.config/pypoetry/config.toml (requires >= 2.4.0)
+  pdm    pdm config         ~/.config/pdm/config.toml (requires >= 2.27.0)
   npm    .npmrc key         ~/.npmrc
   pnpm   .npmrc key         ~/.npmrc
   yarn   env var export     /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
   bun    bunfig.toml key    ~/.bunfig.toml
   deno   shell aliases      /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
   cargo  env var export     /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
-                            (requires cargo-cooldown crate; use 'cargo cooldown <cmd>')
+                            (requires Cargo >= 1.100, or cargo-cooldown >= 0.3.1 via 'cargo cooldown <cmd>')
+  bundler env var export    /etc/profile.d/cooldowns.sh (or ~/.zshrc / ~/.bashrc)
+                            (requires Bundler >= 4.0.13)
+  nuget  NuGet.Config attr  ~/.nuget/NuGet/NuGet.Config (requires .NET SDK >= 11.0.100)
 
   Fallback chooses ~/.zshrc or ~/.bashrc based on $SHELL.
 
