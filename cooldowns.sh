@@ -13,6 +13,7 @@
 #   cooldowns.sh check
 #
 # Changelog:
+#   2026-11-24  Fixed check/set aborting under set -e when a tool on PATH fails to run (e.g. pnpm shim without node)
 #   2026-11-16  Added nuget support (minPublishAgeHours on the nuget.org source, .NET SDK >= 11.0.100)
 #   2026-11-12  Cargo >= 1.100: no longer require cargo-cooldown; detect global-min-publish-age in ~/.cargo/config.toml; warn when cargo's cooldown is "0"
 #   2026-09-29  Fixed npm check reporting an unset min-release-age ("null") as configured
@@ -366,7 +367,7 @@ set_poetry() {
     fi
 
     local poetry_version
-    poetry_version=$(poetry --version 2>/dev/null | awk '{ gsub(/[()]/, ""); print $NF }')
+    poetry_version=$(poetry --version 2>/dev/null | awk '{ gsub(/[()]/, ""); print $NF }') || poetry_version=""
     if [[ -n "$poetry_version" ]] && ! version_gte "$poetry_version" "2.4.0"; then
         echo "poetry: solver.min-release-age requires poetry >= 2.4.0 (found $poetry_version), skipping"
         return
@@ -402,7 +403,7 @@ set_pdm() {
     fi
 
     local pdm_version
-    pdm_version=$(pdm --version 2>/dev/null | awk '{ print $NF }')
+    pdm_version=$(pdm --version 2>/dev/null | awk '{ print $NF }') || pdm_version=""
     if [[ -n "$pdm_version" ]] && ! version_gte "$pdm_version" "2.27.0"; then
         echo "pdm: strategy.exclude-newer requires pdm >= 2.27.0 (found $pdm_version), skipping"
         return
@@ -441,7 +442,7 @@ set_npmrc_key() {
 set_npm() {
     if command -v npm &>/dev/null; then
         local npm_major
-        npm_major=$(npm --version 2>/dev/null | cut -d. -f1)
+        npm_major=$(npm --version 2>/dev/null | cut -d. -f1) || npm_major=""
         if [[ -n "$npm_major" ]] && [[ "$npm_major" -lt 11 ]]; then
             echo "npm: warning: min-release-age requires npm >= 11 (found npm ${npm_major}.x)" >&2
         fi
@@ -993,7 +994,7 @@ check_pdm() {
 check_npm() {
     local npm_major=""
     if command -v npm &>/dev/null; then
-        npm_major=$(npm --version 2>/dev/null | cut -d. -f1)
+        npm_major=$(npm --version 2>/dev/null | cut -d. -f1) || npm_major=""
     fi
 
     local npmrc="${HOME}/.npmrc"
@@ -1029,7 +1030,7 @@ check_pnpm() {
     fi
     # pnpm v11+ ships a built-in default of 1440 minutes (1 day)
     local pnpm_ver
-    pnpm_ver=$(pnpm --version 2>/dev/null)
+    pnpm_ver=$(pnpm --version 2>/dev/null) || pnpm_ver=""
     if [[ -n "$pnpm_ver" ]] && version_gte "$pnpm_ver" "11.0.0"; then
         record pnpm $STATUS_OK "v11+ built-in default (1440 min / 1 day)"
         return
