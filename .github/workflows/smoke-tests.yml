@@ -1,5 +1,5 @@
-# Smoke-test cooldowns.sh (Linux + macOS). Logic: ci/smoke-test.sh
-# (fed on stdin: bash -s <profile> < ci/smoke-test.sh — same pattern in Docker and on host).
+# Smoke-test cooldowns.sh (Linux + macOS). Logic: tests/smoke-test.sh
+# (fed on stdin: bash -s <profile> < tests/smoke-test.sh — same pattern in Docker and on host).
 # https://github.com/mprpic/cooldowns/pull/1
 name: Smoke tests
 
@@ -24,24 +24,28 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Pin Node/npm on every runner (npm 11+ avoids `check` WARN for min-release-age).
       # Linux smoke runs in Docker (isolated); macOS smoke uses host PATH, so this matters there.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
+
+      - name: Install pnpm (macOS only; Linux installs pnpm inside the Docker container)
+        if: runner.os == 'macOS'
+        run: npm install -g pnpm
 
       - name: Smoke test
         run: |
           set -euo pipefail
-          script="$GITHUB_WORKSPACE/ci/smoke-test.sh"
+          script="$GITHUB_WORKSPACE/tests/smoke-test.sh"
 
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             docker run --rm -i \
               -v "$GITHUB_WORKSPACE/cooldowns.sh:/usr/local/bin/cooldowns.sh:ro" \
-              debian:stable-slim \
-              bash -s /etc/profile.d/cooldowns.sh < "$script"
+              node:lts-slim \
+              bash -c 'npm install -g pnpm --quiet && bash -s /etc/profile.d/cooldowns.sh' < "$script"
           else
             export PATH="$GITHUB_WORKSPACE:$PATH"
             chmod +x "$GITHUB_WORKSPACE/cooldowns.sh"
@@ -49,7 +53,7 @@ jobs:
               export HOME=$(mktemp -d)
               unset ZDOTDIR
               export SHELL=/bin/zsh
-              unset UV_EXCLUDE_NEWER YARN_NPM_MINIMAL_AGE_GATE COOLDOWN_MINUTES PIP_UPLOADED_PRIOR_TO 2>/dev/null || true
+              unset UV_EXCLUDE_NEWER YARN_NPM_MINIMAL_AGE_GATE CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE COOLDOWN_MINUTES PIP_UPLOADED_PRIOR_TO BUNDLE_COOLDOWN 2>/dev/null || true
               trap 'rm -rf "$HOME"' EXIT
               bash -s "$HOME/.zshrc" < "$script"
             )
